@@ -58,12 +58,18 @@ namespace mpc_local_planner {
 bool Controller::configure(ros::NodeHandle& nh, const teb_local_planner::ObstContainer& obstacles,
                            teb_local_planner::RobotFootprintModelPtr robot_model, const std::vector<teb_local_planner::PoseSE2>& via_points)
 {
+
+    // 獲取機器人運動學模型。
     _dynamics = configureRobotDynamics(nh);
     if (!_dynamics) return false;  // we may need state and control dimensions to check other parameters
 
+    // 優化過程的步長設定（？）
     _grid   = configureGrid(nh);
+
+    // 選擇優化算法
     _solver = configureSolver(nh);
 
+    // 定義最佳化問題（成本函數、約束條件、狀態變量的共變異矩陣等等）
     _structured_ocp = configureOcp(nh, obstacles, robot_model, via_points);
     _ocp            = _structured_ocp;  // copy pointer also to parent member
 
@@ -125,6 +131,7 @@ bool Controller::step(const std::vector<geometry_msgs::PoseStamped>& initial_pla
     PoseSE2 start(initial_plan.front().pose);
     PoseSE2 goal(initial_plan.back().pose);
 
+    // 根據 goal 資訊來獲得最終目標的 Pose Vector
     Eigen::VectorXd xf(_dynamics->getStateDimension());
     _dynamics->getSteadyStateFromPoseSE2(goal, xf);
 
@@ -134,15 +141,26 @@ bool Controller::step(const std::vector<geometry_msgs::PoseStamped>& initial_pla
     bool new_x = false;
     {
         std::lock_guard<std::mutex> lock(_x_feedback_mutex);
+        // 會根據容器（stateFeedback收到的內容）內是否有值與時間差（目前時間與收到stateFeedback的時間）來決定是更新目前狀態
         new_x = _recent_x_feedback.size() > 0 && (t - _recent_x_time).toSec() < 2.0 * dt;
         if (new_x) x = _recent_x_feedback;
     }
+
+    // _x_ts 是 PredictiveController父類的Protected 成員變數，類別是TimeSeries::Ptr
+    // 他代表控制器在求解MPC优化问题后得到的预测轨迹中的状态序列
     if (!new_x && (!_x_ts || _x_ts->isEmpty() || !_x_ts->getValuesInterpolate(dt, x)))  // predict with previous state sequence
     {
+        // 沒有new_x, 或沒有預測狀態，就用初始值來估計目前狀態
         _dynamics->getSteadyStateFromPoseSE2(start, x);  // otherwise initialize steady state
     }
+
     if (!new_x || !_prefer_x_feedback)
     {
+        // 沒有new_x 或者使用者想要混合stateFeedback和Odom Feedback
+        // 這邊 vel 好像沒有用到，因為 dynamics 的型別都是繼承於 BaseRobotSE2，這個方法在裡面被實現的。
+        // 所以他應該就是單純拿 start 來初始化 x 而已。
+        // 但這邊的 start 是 initial_plan 的第一個元素，所以理論上會是機器人目前的Odom狀態
+
         // Merge state feedback with odometry feedback if desired.
         // Note, some models like unicycle overwrite the full state by odom feedback unless _prefer_x_measurement is set to true.
         _dynamics->mergeStateFeedbackAndOdomFeedback(start, vel, x);
@@ -191,6 +209,7 @@ void Controller::stateFeedbackCallback(const mpc_local_planner_msgs::StateFeedba
 
     std::lock_guard<std::mutex> lock(_x_feedback_mutex);
     _recent_x_time     = msg->header.stamp;
+    // 轉型 msg 資料成 Eigen 格式。
     _recent_x_feedback = Eigen::Map<const Eigen::VectorXd>(msg->state.data(), (int)msg->state.size());
 }
 
@@ -484,13 +503,16 @@ corbo::StructuredOptimalControlProblem::Ptr Controller::configureOcp(const ros::
                                                                      teb_local_planner::RobotFootprintModelPtr robot_model,
                                                                      const std::vector<teb_local_planner::PoseSE2>& via_points)
 {
+    // 創建超圖對象：優化的結構與優化問題定義
     corbo::BaseHyperGraphOptimizationProblem::Ptr hg = std::make_shared<corbo::HyperGraphOptimizationProblemEdgeBased>();
 
+    // 創建優化問題的結構化指標：把零零碎碎的部件組合起來後續使用。
     corbo::StructuredOptimalControlProblem::Ptr ocp = std::make_shared<corbo::StructuredOptimalControlProblem>(_grid, _dynamics, hg, _solver);
 
     const int x_dim = _dynamics->getStateDimension();
     const int u_dim = _dynamics->getInputDimension();
 
+    // 根據機器人型別設定 Control Input 的上下限。
     if (_robot_type == "unicycle")
     {
         double max_vel_x = 0.4;
@@ -548,6 +570,8 @@ corbo::StructuredOptimalControlProblem::Ptr Controller::configureOcp(const ros::
         return {};
     }
 
+
+    // 定義目標函數
     std::string objective_type = "minimum_time";
     nh.param("planning/objective/type", objective_type, objective_type);
     bool lsq_solver = _solver->isLsqSolver();
@@ -563,10 +587,12 @@ corbo::StructuredOptimalControlProblem::Ptr Controller::configureOcp(const ros::
         Eigen::MatrixXd Q;
         if (state_weights.size() == x_dim)
         {
+            // 只考慮對角項的共變異數值（變數間不互相影響）
             Q = Eigen::Map<Eigen::VectorXd>(state_weights.data(), x_dim).asDiagonal();
         }
         else if (state_weights.size() == x_dim * x_dim)
         {
+            // 使用者考慮所有共變異數值（變數間可能互相影響，如果該數值非0的話）
             Q = Eigen::Map<Eigen::MatrixXd>(state_weights.data(), x_dim, x_dim);  // Eigens default is column major
         }
         else
@@ -574,6 +600,7 @@ corbo::StructuredOptimalControlProblem::Ptr Controller::configureOcp(const ros::
             ROS_ERROR_STREAM("State weights dimension invalid. Must be either " << x_dim << " x 1 or " << x_dim << " x " << x_dim << ".");
             return {};
         }
+        // 這邊對於建立 R 的共變異數矩陣概念和 Q 相同。
         std::vector<double> control_weights;
         nh.param("planning/objective/quadratic_form/control_weights", control_weights, control_weights);
         Eigen::MatrixXd R;
@@ -590,8 +617,13 @@ corbo::StructuredOptimalControlProblem::Ptr Controller::configureOcp(const ros::
             ROS_ERROR_STREAM("Control weights dimension invalid. Must be either " << u_dim << " x 1 or " << u_dim << " x " << u_dim << ".");
             return {};
         }
+
+        // 決定成本函數使用積分和（J = ∫₀ᵀ L(x(t), u(t)) dt，複雜）還是離散和（J = ∑ᵢ₌₀ᴺ L(xᵢ, uᵢ)，簡單）形式。
         bool integral_form = false;
         nh.param("planning/objective/quadratic_form/integral_form", integral_form, integral_form);
+        
+        // hybrid_cost_minimum_time 是為了要尝试同时实现两个目标：让机器人尽可能快地到达目标（最小时间）、保持控制输入的平滑性（通过二次型控制成本）
+        // 只有控制权重矩阵R不为零时（Q为零）才能採用。
         bool hybrid_cost_minimum_time = false;
         nh.param("planning/objective/quadratic_form/hybrid_cost_minimum_time", hybrid_cost_minimum_time, hybrid_cost_minimum_time);
 
@@ -673,6 +705,7 @@ corbo::StructuredOptimalControlProblem::Ptr Controller::configureOcp(const ros::
         return {};
     }
 
+    // 终端约束(terminal constraint)，这是指系统在预测时域末端(最后一个时间步)必须满足的条件。
     std::string terminal_constraint = "none";
     nh.param("planning/terminal_constraint/type", terminal_constraint, terminal_constraint);
 
@@ -680,6 +713,7 @@ corbo::StructuredOptimalControlProblem::Ptr Controller::configureOcp(const ros::
     {
         ocp->setFinalStageConstraint({});
     }
+    // 更复杂的约束，要求系统在预测时域末端的状态必须落在目标状态周围的一个"球"内。简单来说，就是终点状态与目标状态的加权距离必须小于指定的半径。
     else if (terminal_constraint == "l2_ball")
     {
         std::vector<double> weight_matrix;
@@ -708,6 +742,7 @@ corbo::StructuredOptimalControlProblem::Ptr Controller::configureOcp(const ros::
         return {};
     }
 
+    // 設定ineq約束條件
     _inequality_constraint = std::make_shared<StageInequalitySE2>();
     _inequality_constraint->setObstacleVector(obstacles);
     _inequality_constraint->setRobotFootprintModel(robot_model);
@@ -729,7 +764,7 @@ corbo::StructuredOptimalControlProblem::Ptr Controller::configureOcp(const ros::
     _inequality_constraint->setObstacleFilterParameters(force_inclusion_dist, cutoff_dist);
 
     // configure control deviation bounds
-
+    // 根據模型，來設定Control偏差的上下界
     if (_robot_type == "unicycle")
     {
         double acc_lim_x = 0.0;
