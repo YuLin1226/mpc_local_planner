@@ -167,6 +167,9 @@ bool Controller::step(const std::vector<geometry_msgs::PoseStamped>& initial_pla
     }
 
     // now check goal
+    // 這邊使用 last goal & goal position 來判別是否要重新初始化的原因應該是
+    // 餵進去給 initial_plan 的內容可能不是 full global path, 應該是一段一段的
+    // 所以才需要拿目前的 goal 和前一次的 goal 來做比較，避免 loop 的時候計算發散。（我目前是這樣猜測）
     if (_force_reinit_num_steps > 0 && _ocp_seq % _force_reinit_num_steps == 0) _grid->clear();
     if (!_grid->isEmpty() && ((goal.position() - _last_goal.position()).norm() > _force_reinit_new_goal_dist ||
                               std::abs(normalize_theta(goal.theta() - _last_goal.theta())) > _force_reinit_new_goal_angular))
@@ -187,6 +190,13 @@ bool Controller::step(const std::vector<geometry_msgs::PoseStamped>& initial_pla
     corbo::StaticReference xref(xf);  // currently, we only support point-to-point transitions in ros
     corbo::ZeroReference uref(_dynamics->getInputDimension());
 
+
+    // 呼叫父類的step, 裡面其實就是使用 OCP 去做 optimization 然後把結果吐回來。
+    // 但我想特別提的地方是「機器人模型」的部份，也就是 _dynamics 而非 robot_model(這個好像是footprint)
+    // configureOCP 的地方已經有把 _dynamic 也一起丟給去給 OCP 了，所以他其實是有機器人動態模型的
+    // 內部 OCP 呼叫 compute，其中這包含 grid 會離散化網格，然後 solver 會求解最佳化問題
+    //另外，有一個特別的地方xref & uref好像是單純的一筆 3x1 矩陣而已。
+    // 然後 grid 只根據這些值去離散出網格用於後續求解，並非真的拿傳進來的一串 initial plan 去離散化網格。
     _ocp_successful = PredictiveController::step(x, xref, uref, corbo::Duration(dt), time, u_seq, x_seq, nullptr, nullptr, &_x_seq_init);
     // publish results if desired
     if (_publish_ocp_results) publishOptimalControlResult();  // TODO(roesmann): we could also pass time t from above
